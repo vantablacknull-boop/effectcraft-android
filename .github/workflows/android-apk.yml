@@ -1,0 +1,352 @@
+# EffectCraft 0.20.0 -> APK Android (arm64), tudo em um arquivo.
+# Cole este arquivo em .github/workflows/android-apk.yml no seu repositório e rode em Actions.
+# Baixa o código original (storytold/effectcraft, tag v0.20.0), aplica o porte Android e compila.
+name: Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NDK_VERSION: 27.2.12479018
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Baixar o codigo original
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/effectcraft
+          ref: v0.20.0
+
+      - name: Aplicar o porte Android
+        run: |
+          set -euo pipefail
+          mkdir -p apps/effectcraft-android/src apps/effectcraft-android/res/mipmap-xxxhdpi
+          cat > apps/effectcraft-android/Cargo.toml <<'EFFECTCRAFT_EOF'
+          [package]
+          name = "effectcraft-android"
+          description = "EffectCraft for Android (NativeActivity shell around the shared egui app)"
+          version.workspace = true
+          edition.workspace = true
+          license.workspace = true
+          rust-version.workspace = true
+          publish = false
+
+          [lib]
+          name = "effectcraft_android"
+          # Android loads the app as a shared library (libeffectcraft_android.so).
+          crate-type = ["cdylib"]
+
+          # Not `workspace = true`: the Android entry point is `#[unsafe(no_mangle)] fn android_main` and the
+          # config folder is set with `std::env::set_var` (unsafe since edition 2024). Both are in
+          # src/android.rs only, each with a SAFETY comment; the rest of the workspace stays `forbid`.
+          [lints.rust]
+          unsafe_code = "allow"
+
+          [lints.clippy]
+          cognitive_complexity = "deny"
+          too_many_arguments = "deny"
+          wildcard_imports = "deny"
+
+          [target.'cfg(target_os = "android")'.dependencies]
+          effectcraft-engine = { workspace = true }
+          effectcraft-host = { workspace = true }
+          effectcraft-ui-egui = { workspace = true }
+          egui = { workspace = true }
+          eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
+          # The same winit eframe runs on (patched to the fork in the workspace); the Android feature picks
+          # the NativeActivity glue, which needs no Java code in the APK.
+          winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+          log = { workspace = true }
+          android_logger = "0.15"
+
+          # ---- cargo-apk (https://github.com/rust-mobile/cargo-apk) ------------------------------------
+          [package.metadata.android]
+          package = "ai.storyteller.effectcraft"
+          apk_name = "EffectCraft"
+          resources = "res"
+          # Only the phone's ABI: the vivo Y20s is arm64-v8a. Half the build time and a smaller APK.
+          build_targets = ["aarch64-linux-android"]
+
+          [package.metadata.android.sdk]
+          min_sdk_version = 29
+          target_sdk_version = 34
+
+          [package.metadata.android.application]
+          label = "EffectCraft"
+          icon = "@mipmap/ic_launcher"
+          # Full screen: no status bar over the toolbar (egui has no safe-area inset on NativeActivity yet).
+          theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+          [package.metadata.android.application.activity]
+          # The editor's panels need width: landscape only.
+          orientation = "landscape"
+          EFFECTCRAFT_EOF
+          cat > apps/effectcraft-android/src/lib.rs <<'EFFECTCRAFT_EOF'
+          //! EffectCraft for Android: a NativeActivity shell around the same egui app the desktop build runs.
+          //!
+          //! Built with `cargo apk` (see `packaging/android/README.md`). On every other target this crate is
+          //! empty, so `cargo build` on a desktop still works.
+          #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+          #[cfg(target_os = "android")]
+          mod android;
+          EFFECTCRAFT_EOF
+          cat > apps/effectcraft-android/src/android.rs <<'EFFECTCRAFT_EOF'
+          //! The Android entry point: `android_main`, the wgpu setup for phone GPUs, the app's folders and
+          //! the file hooks (no desktop file dialogs on Android; see [`Folders`]).
+
+          use effectcraft_ui_egui::EffectcraftApp;
+          use std::path::{Path, PathBuf};
+          use std::sync::Arc;
+          use winit::platform::android::activity::AndroidApp;
+
+          /// UI scale on top of the phone's density. The desktop layout is dense: 0.75 fits it on a landscape
+          /// phone screen (the vivo Y20s is 1560x720 px, about 820x380 points at its density).
+          const ZOOM: f32 = 0.75;
+
+          /// Textures larger than this are refused by the compositor, which then falls back to the CPU.
+          /// Rogue-class phone GPUs run out of memory well before the desktop's 16384 px.
+          const MAX_TEXTURE: u32 = 8192;
+
+          /// The folders the file hooks use, in the app's own storage on the shared volume
+          /// (`/sdcard/Android/data/ai.storyteller.effectcraft/files/…`), reachable from any file manager
+          /// and from a USB cable without any storage permission.
+          #[derive(Clone)]
+          struct Folders {
+              media: PathBuf,
+              projects: PathBuf,
+              exports: PathBuf,
+          }
+
+          impl Folders {
+              fn new(root: &Path) -> Self {
+                  let make = |name: &str| {
+                      let dir = root.join(name);
+                      if let Err(e) = std::fs::create_dir_all(&dir) {
+                          log::warn!("{}: {e}", dir.display());
+                      }
+                      dir
+                  };
+                  Self { media: make("Media"), projects: make("Projects"), exports: make("Exports") }
+              }
+
+              /// Files in `dir` with one of `exts` (case-insensitive), sorted by name.
+              fn files(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
+                  let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+                      .into_iter()
+                      .flatten()
+                      .flatten()
+                      .map(|e| e.path())
+                      .filter(|p| p.is_file())
+                      .filter(|p| exts.is_empty() || p.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|x| exts.iter().any(|e| e.eq_ignore_ascii_case(x))))
+                      .collect();
+                  out.sort();
+                  out
+              }
+
+              /// The most recently modified file in `dir` with one of `exts`.
+              fn newest(dir: &Path, exts: &[&str]) -> Option<PathBuf> {
+                  Self::files(dir, exts).into_iter().max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+              }
+          }
+
+          fn path_string(p: PathBuf) -> String {
+              p.to_string_lossy().to_string()
+          }
+
+          /// Install the file hooks. Android has no desktop dialogs, so Import takes every matching file in
+          /// `Media/`, Open Project the newest project in `Projects/`, and Save writes into `Projects/` or
+          /// `Exports/` (a real Storage Access Framework picker needs Java code; see the README).
+          fn install_file_hooks(app: &mut EffectcraftApp, folders: &Folders) {
+              let f = folders.clone();
+              app.hooks.pick_files = Some(Box::new(move |exts: &[&str]| Folders::files(&f.media, exts).into_iter().map(path_string).collect()));
+              let f = folders.clone();
+              app.hooks.pick_open_project = Some(Box::new(move || Folders::newest(&f.projects, &["ecproj", "ecprojx"]).map(path_string)));
+              let f = folders.clone();
+              app.hooks.pick_save = Some(Box::new(move |name: &str| {
+                  let file = Path::new(name).file_name()?;
+                  Some(path_string(f.projects.join(file)))
+              }));
+              let f = folders.clone();
+              app.hooks.pick_folder = Some(Box::new(move || Some(path_string(f.exports.clone()))));
+              let f = folders.clone();
+              app.hooks.pick_save_file = Some(Box::new(move |name: &str, _ext: &str| {
+                  let file = Path::new(name).file_name()?;
+                  Some(path_string(f.exports.join(file)))
+              }));
+          }
+
+          /// The window's wgpu setup for a phone: Vulkan first, OpenGL ES as the fallback (PowerVR Rogue
+          /// Vulkan drivers on Android 10 are the usual suspects when the window fails to open), the adapter's
+          /// own limits with the texture size capped, and memory-frugal allocation.
+          fn wgpu_options() -> eframe::WgpuConfiguration {
+              use eframe::egui_wgpu::WgpuSetup;
+              let mut config = eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig::LOW_LATENCY);
+              if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+                  setup.instance_descriptor.backends = eframe::wgpu::Backends::VULKAN | eframe::wgpu::Backends::GL;
+                  setup.instance_descriptor.flags = setup.instance_descriptor.flags.difference(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL).with_env();
+                  setup.device_descriptor = Arc::new(|adapter| {
+                      let limits = adapter.limits();
+                      eframe::wgpu::DeviceDescriptor {
+                          label: Some("EffectCraft device"),
+                          required_limits: eframe::wgpu::Limits { max_texture_dimension_2d: limits.max_texture_dimension_2d.min(MAX_TEXTURE), ..limits },
+                          memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+                          ..Default::default()
+                      }
+                  });
+              }
+              config
+          }
+
+          /// The eframe app: the shared app's frame, without the desktop window tracking and menus.
+          struct Mobile {
+              app: EffectcraftApp,
+          }
+
+          impl eframe::App for Mobile {
+              fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+                  self.app.tick(ctx, frame);
+                  self.app.finish_ime_logic(ctx);
+                  effectcraft_ui_egui::panels::unsaved::quit_on_close(ctx);
+              }
+
+              fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+                  self.app.ui(ui, frame);
+              }
+
+              fn on_exit(&mut self) {
+                  log::info!("the activity is closing");
+                  self.app.on_exit();
+              }
+
+              fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+                  self.app.raw_input_hook(ctx, raw_input);
+              }
+          }
+
+          /// Build the session and the app once the graphics device exists.
+          fn create_app(cc: &eframe::CreationContext<'_>, folders: &Folders) -> Mobile {
+              EffectcraftApp::install_ime_reset_hooks(&cc.egui_ctx);
+              cc.egui_ctx.set_zoom_factor(ZOOM);
+              match &cc.wgpu_render_state {
+                  Some(rs) => log::info!("graphics: {:?}", rs.adapter.get_info()),
+                  None => log::info!("graphics: no wgpu device"),
+              }
+              // Same device-error handling as the desktop app: report instead of crashing.
+              let gpu_failures = effectcraft_ui_egui::gpu_failure::GpuFailureBridge::new(&cc.egui_ctx);
+              if let Some(rs) = &cc.wgpu_render_state {
+                  let errors = gpu_failures.clone();
+                  rs.device.on_uncaptured_error(Arc::new(move |error| {
+                      let message = format!("uncaptured GPU error: {error}");
+                      if errors.report(&message, false) {
+                          log::error!("{message}");
+                      }
+                  }));
+                  let lost = gpu_failures.clone();
+                  rs.device.set_device_lost_callback(move |reason, message| {
+                      lost.report(&format!("GPU device lost ({reason:?}): {message}"), true);
+                  });
+              }
+              let mut session = effectcraft_host::session();
+              session.check_footage_on_open = true;
+              session.autosave.background = true;
+              if let Some(dir) = effectcraft_host::config_dir() {
+                  session.config = Some(Arc::new(effectcraft_engine::config::DirConfig::new(dir)));
+              }
+              session.load_settings();
+              let show_home = session.prefs.startup.show_home_on_launch;
+              let mut app = EffectcraftApp::new(session);
+              // The update check downloads desktop installers; it has nothing to offer an APK.
+              app.set_startup_update_check(false);
+              app.set_gpu_failure_bridge(gpu_failures);
+              app.ui.start_screen = show_home;
+              install_file_hooks(&mut app, folders);
+              log::info!("app created");
+              Mobile { app }
+          }
+
+          /// The activity's entry point (found by name by the NativeActivity glue).
+          #[unsafe(no_mangle)]
+          fn android_main(app: AndroidApp) {
+              android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("EffectCraft"));
+              log::info!("effectcraft {}: starting", env!("CARGO_PKG_VERSION"));
+
+              // Settings, shortcuts, crash-recovery data and logs live in the app's private storage.
+              if let Some(private) = app.internal_data_path() {
+                  // SAFETY: the first statements of the process's only app thread, before any other thread of
+                  // ours exists; nothing else reads or writes the environment concurrently.
+                  unsafe { std::env::set_var("EFFECTCRAFT_CONFIG_DIR", private.join("config")) };
+              }
+              // Media, projects and exports go where the user can reach them; the private folder is the
+              // fallback when the shared volume isn't mounted.
+              let root = app.external_data_path().or_else(|| app.internal_data_path()).unwrap_or_else(|| PathBuf::from("/data/local/tmp"));
+              let folders = Folders::new(&root);
+
+              let options = eframe::NativeOptions { android_app: Some(app), wgpu_options: wgpu_options(), ..Default::default() };
+              let result = eframe::run_native("EffectCraft", options, Box::new(move |cc| Ok(Box::new(create_app(cc, &folders)))));
+              if let Err(e) = result {
+                  log::error!("EffectCraft couldn't start its window: {e}");
+              }
+          }
+          EFFECTCRAFT_EOF
+          cp assets/app-icon/hicolor/256x256/apps/ai.storyteller.effectcraft.png apps/effectcraft-android/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Instalar NDK e plataforma
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_ROOT=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+
+      - name: Instalar cargo-apk
+        run: cargo install cargo-apk --locked
+
+      - name: Criar chave de assinatura
+        run: |
+          keytool -genkeypair -keystore "$RUNNER_TEMP/effectcraft.jks" -alias effectcraft \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass effectcraft -keypass effectcraft \
+            -dname "CN=EffectCraft, O=Local build, C=AO"
+          echo "CARGO_APK_RELEASE_KEYSTORE=$RUNNER_TEMP/effectcraft.jks" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=effectcraft" >> "$GITHUB_ENV"
+
+      - name: Compilar o APK
+        env:
+          RUSTFLAGS: -C target-cpu=cortex-a53
+        run: cargo apk build --release -p effectcraft-android
+
+      - name: Juntar o APK
+        run: |
+          mkdir -p out
+          cp target/release/apk/*.apk out/EffectCraft-arm64.apk
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EffectCraft-arm64-apk
+          path: out/EffectCraft-arm64.apk
+          if-no-files-found: error
