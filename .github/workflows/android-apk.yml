@@ -299,6 +299,18 @@ jobs:
           }
           EFFECTCRAFT_EOF
           cp assets/app-icon/hicolor/256x256/apps/ai.storyteller.effectcraft.png apps/effectcraft-android/res/mipmap-xxxhdpi/ic_launcher.png
+          # eframe recusa "accesskit" com NativeActivity no Android: no Android o ui-egui usa o eframe sem
+          # accesskit e sem clipboard (o resto do app nao muda; o egui continua com acessibilidade interna).
+          sed -i '/^eframe = { workspace = true, features = \["default_fonts", "wgpu", "accesskit", "clipboard"\] }$/d' crates/ui-egui/Cargo.toml
+          if grep -q '^eframe = ' crates/ui-egui/Cargo.toml; then echo "ERRO: linha do eframe nao removida"; exit 1; fi
+          cat >> crates/ui-egui/Cargo.toml <<'EFFECTCRAFT_EOF'
+
+          [target.'cfg(not(target_os = "android"))'.dependencies]
+          eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "clipboard"] }
+
+          [target.'cfg(target_os = "android")'.dependencies]
+          eframe = { workspace = true, features = ["default_fonts", "wgpu"] }
+          EFFECTCRAFT_EOF
 
       - uses: actions/setup-java@v4
         with:
